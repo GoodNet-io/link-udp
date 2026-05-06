@@ -7,7 +7,7 @@
   description = "GoodNet link plugin: udp — standalone plugin flake.";
 
   inputs = {
-    goodnet.url     = "path:../../..";
+    goodnet.url     = "git+file:../../..?dir=nix/kernel-only";
     nixpkgs.follows = "goodnet/nixpkgs";
   };
 

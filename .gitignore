@@ -17,7 +17,6 @@
 !CMakeLists.txt
 !default.nix
 !flake.nix
-!flake.lock
 
 # Source (top level)
 !*.cpp
