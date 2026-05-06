@@ -1,0 +1,19 @@
+GoodNet Plugin — GPL-2.0 with Linking Exception
+================================================
+
+This plugin is licensed under the GNU General Public License v2.0 with
+the same Linking Exception that covers the GoodNet kernel: a plugin or
+host program that interfaces with the kernel only through the stable
+C ABI defined in `sdk/` is not a derivative work of this plugin and
+may carry any license.
+
+Copyright (c) 2026 GoodNet Contributors.
+
+The full text of the licence, including the Linking Exception clause,
+the GPL-2.0 base text, and the boundary definition, lives in
+`core/LICENSE` of the canonical GoodNet repository
+(https://github.com/GoodNet-io/goodnet/blob/main/core/LICENSE). When
+this plugin is lifted into a spinoff repository the full text travels
+alongside as `LICENSE` at that repository's root.
+
+SPDX-License-Identifier: GPL-2.0-only

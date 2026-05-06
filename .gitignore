@@ -1,0 +1,44 @@
+# Inverted gitignore: ignore everything, whitelist what the plugin
+# actually ships. Mirrors the kernel monorepo's convention so
+# `git status` stays honest about the plugin's scope rather than
+# enumerating build artefacts and Nix result symlinks.
+*
+!*/
+
+# Plugin metadata
+!.gitignore
+!.clang-tidy
+!README.md
+!LICENSE
+!CHANGELOG.md
+!SECURITY.md
+
+# Build descriptors
+!CMakeLists.txt
+!default.nix
+!flake.nix
+!flake.lock
+
+# Source (top level)
+!*.cpp
+!*.hpp
+!*.h
+
+# Tests
+!tests/**/*.cpp
+!tests/**/*.hpp
+!tests/**/*.h
+!tests/**/CMakeLists.txt
+
+# Docs
+!docs/**/*.md
+!docs/**/*.png
+!docs/**/*.svg
+
+# Build / output dirs (re-block after the top-level whitelist)
+build/
+build-*/
+result
+result-*
+.direnv/
+.cache/

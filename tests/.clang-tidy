@@ -1,0 +1,10 @@
+---
+# Tests live below this file. GoogleTest (`TEST(...)`) and rapidcheck
+# (`RC_GTEST_PROP(...)`) macros expand to global-scope free functions
+# the framework discovers through static initialisers; static / anon-
+# namespace would defeat the discovery. Inherit the project-wide
+# strict tidy and only loosen the linkage check inside test trees.
+InheritParentConfig: true
+Checks: >
+  -misc-use-internal-linkage
+...
