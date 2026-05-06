@@ -5,7 +5,7 @@
 
 #include <gtest/gtest.h>
 
-#include <plugins/links/udp/udp.hpp>
+#include <udp.hpp>
 
 #include <asio/io_context.hpp>
 #include <asio/ip/udp.hpp>

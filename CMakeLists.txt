@@ -5,7 +5,6 @@ if(NOT TARGET GoodNet::sdk)
         VERSION   0.1.0
         LANGUAGES CXX)
     find_package(GoodNet REQUIRED)
-    goodnet_standalone_plugin_includes()
     include(CTest)
     if(BUILD_TESTING)
         find_package(GTest      REQUIRED)
