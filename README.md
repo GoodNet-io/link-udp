@@ -31,9 +31,9 @@ cmake --build build
 
 Manifest entry pins the SHA-256 digest; `gn_plugin_init` registers
 the `udp` scheme. See `docs/install.md` and
-`docs/contracts/plugin-manifest.md` in the kernel tree.
+`docs/contracts/plugin-manifest.en.md` in the kernel tree.
 
 ## Contract
 
-- Kernel-side link contract: `docs/contracts/link.md`
-- Datagram-class invariants: `docs/contracts/link.md` §reliability
+- Kernel-side link contract: `docs/contracts/link.en.md`
+- Datagram-class invariants: `docs/contracts/link.en.md` §reliability
