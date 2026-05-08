@@ -30,6 +30,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
@@ -163,7 +164,14 @@ private:
 
     asio::io_context                                          ioc_;
     asio::executor_work_guard<asio::io_context::executor_type> work_;
-    std::thread                                                      worker_;
+    /// Multiple workers run the same `io_context`. UDP has only one
+    /// socket and a single shared strand, so the strand serialises
+    /// every receive / send regardless of how many threads call
+    /// `ioc_.run()`. The pool is kept symmetric with the other link
+    /// plugins per `docs/impl/cpp/transports.ru.md` so an operator
+    /// tuning `TasksMax=` sees a uniform thread count across the
+    /// transport set.
+    std::vector<std::thread>                                  workers_;
 
     /// One strand per *socket* — UDP has no per-session strand because
     /// every datagram crosses the same FD. Both `async_receive_from`
