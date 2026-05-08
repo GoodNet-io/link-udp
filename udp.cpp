@@ -14,7 +14,9 @@
 #include <asio/ip/v6_only.hpp>
 #include <system_error>
 
+#include <algorithm>
 #include <cstring>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -35,7 +37,16 @@ UdpLink::UdpLink()
     : ioc_(),
       work_(asio::make_work_guard(ioc_)),
       strand_(asio::make_strand(ioc_.get_executor())) {
-    worker_ = std::thread([this] { ioc_.run(); });
+    /// Match the worker-pool size of the other link plugins. UDP's
+    /// own throughput stays bound by the single shared strand
+    /// (`strand_`); the extra threads are kept for symmetry across
+    /// the transport set rather than for a measurable speedup here.
+    const unsigned hc = std::thread::hardware_concurrency();
+    const unsigned n  = std::max(1u, hc / 2);
+    workers_.reserve(n);
+    for (unsigned i = 0; i < n; ++i) {
+        workers_.emplace_back([this] { ioc_.run(); });
+    }
 }
 
 UdpLink::~UdpLink() {
@@ -575,7 +586,10 @@ void UdpLink::shutdown() {
 
     work_.reset();
     ioc_.stop();
-    if (worker_.joinable()) worker_.join();
+    for (auto& w : workers_) {
+        if (w.joinable()) w.join();
+    }
+    workers_.clear();
 }
 
 }  // namespace gn::link::udp
