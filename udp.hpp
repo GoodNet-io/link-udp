@@ -92,6 +92,30 @@ public:
 
     [[nodiscard]] gn_result_t disconnect(gn_conn_id_t conn);
 
+    /// L2-composition surface per `link.en.md` §8. The datagram-mode
+    /// composer (ICE) opens one or more UDP candidates as L1 carriers,
+    /// runs its own connectivity-check FSM, then publishes the
+    /// chosen-candidate L2 conn upward via `notify_connect`.
+    ///
+    /// `composer_listen(uri)` binds an L1 receiver; arriving datagrams
+    /// land on per-peer subscriptions through `composer_subscribe_data`
+    /// instead of the kernel inbound path. `composer_connect(uri, &out)`
+    /// allocates a peer record the composer owns; the synthesised
+    /// `gn_conn_id_t` is issued from the composer-private range
+    /// (high bit set) and cannot collide with kernel-managed ids.
+    ///
+    /// Foundation step: stub bodies return GN_ERR_NOT_IMPLEMENTED;
+    /// real composer flow lands when the ICE plugin migrates from
+    /// its inline UDP socket to this surface.
+    [[nodiscard]] gn_result_t composer_listen(std::string_view uri);
+    [[nodiscard]] gn_result_t composer_connect(std::string_view uri,
+                                                gn_conn_id_t* out_conn);
+    [[nodiscard]] gn_result_t composer_subscribe_data(
+        gn_conn_id_t conn,
+        ::gn_link_data_cb_t cb,
+        void* user_data);
+    [[nodiscard]] gn_result_t composer_unsubscribe_data(gn_conn_id_t conn);
+
     void set_host_api(const host_api_t* api) noexcept;
 
     /// Reconfigure the per-source-IP new-connection limiter live.

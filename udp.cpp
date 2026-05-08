@@ -429,6 +429,26 @@ gn_result_t UdpLink::disconnect(gn_conn_id_t conn) {
     return GN_OK;
 }
 
+gn_result_t UdpLink::composer_listen(std::string_view /*uri*/) {
+    return GN_ERR_NOT_IMPLEMENTED;
+}
+
+gn_result_t UdpLink::composer_connect(std::string_view /*uri*/,
+                                       gn_conn_id_t* out_conn) {
+    if (out_conn) *out_conn = GN_INVALID_ID;
+    return GN_ERR_NOT_IMPLEMENTED;
+}
+
+gn_result_t UdpLink::composer_subscribe_data(gn_conn_id_t /*conn*/,
+                                              ::gn_link_data_cb_t /*cb*/,
+                                              void* /*user_data*/) {
+    return GN_ERR_NOT_IMPLEMENTED;
+}
+
+gn_result_t UdpLink::composer_unsubscribe_data(gn_conn_id_t /*conn*/) {
+    return GN_ERR_NOT_IMPLEMENTED;
+}
+
 void UdpLink::start_receive() {
     if (!socket_ || shutdown_.load(std::memory_order_acquire)) return;
 
