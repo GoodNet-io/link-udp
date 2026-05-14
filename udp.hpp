@@ -104,9 +104,16 @@ public:
     /// `gn_conn_id_t` is issued from the composer-private range
     /// (high bit set) and cannot collide with kernel-managed ids.
     ///
-    /// Foundation step: stub bodies return GN_ERR_NOT_IMPLEMENTED;
-    /// real composer flow lands when the ICE plugin migrates from
-    /// its inline UDP socket to this surface.
+    /// UDP composer accept-bus runs on first-datagram-from-unknown-peer
+    /// semantics — datagram sockets have no L4 accept, but composers
+    /// that listen for new clients (DTLS server, ICE responder) need
+    /// to learn about each new peer endpoint. When a datagram arrives
+    /// from an endpoint not seen in either the kernel or composer maps,
+    /// the recv loop allocates a composer-owned conn id, fires every
+    /// subscriber, then dispatches the triggering datagram through
+    /// whichever per-conn `composer_subscribe_data` callback the
+    /// accept handler installed. Datagrams from a known composer
+    /// endpoint route straight to the data sub.
     [[nodiscard]] gn_result_t composer_listen(std::string_view uri);
     [[nodiscard]] gn_result_t composer_connect(std::string_view uri,
                                                 gn_conn_id_t* out_conn);
@@ -115,6 +122,18 @@ public:
         ::gn_link_data_cb_t cb,
         void* user_data);
     [[nodiscard]] gn_result_t composer_unsubscribe_data(gn_conn_id_t conn);
+    [[nodiscard]] gn_result_t composer_subscribe_accept(
+        ::gn_link_accept_cb_t cb,
+        void* user_data,
+        gn_subscription_id_t* out_token);
+    [[nodiscard]] gn_result_t composer_unsubscribe_accept(
+        gn_subscription_id_t token);
+
+    /// Bound port of the composer-side socket (ephemeral
+    /// `composer_listen` discovery). UDP has a single shared FD across
+    /// kernel and composer paths so this mirrors `listen_port_`.
+    [[nodiscard]] gn_result_t composer_listen_port(
+        std::uint16_t* out_port) const noexcept;
 
     void set_host_api(const host_api_t* api) noexcept;
 
@@ -224,6 +243,39 @@ private:
     /// `set_host_api(nullptr)` and on dtor so the kernel's
     /// signal channel doesn't fire into a freed `this`.
     std::uint64_t                                                   reload_sub_id_{0};
+
+    /// Composer-owned peer state lives in a map disjoint from the
+    /// kernel-managed `peers_`. The high bit of `gn_conn_id_t`
+    /// (`kComposerIdBit`) is reserved for composer ids — `send` and
+    /// `disconnect` route by id mask without scanning both maps. UDP
+    /// shares a single socket between kernel and composer paths
+    /// (datagram FDs are monolithic by construction).
+    static constexpr gn_conn_id_t kComposerIdBit =
+        static_cast<gn_conn_id_t>(1ULL) << 63;
+
+    struct ComposerDataSub {
+        ::gn_link_data_cb_t cb;
+        void*               user_data;
+    };
+    struct ComposerAcceptSub {
+        gn_subscription_id_t  token     = GN_INVALID_SUBSCRIPTION_ID;
+        ::gn_link_accept_cb_t cb        = nullptr;
+        void*                 user_data = nullptr;
+    };
+
+    mutable std::mutex                                              composer_mu_;
+    std::unordered_map<gn_conn_id_t, asio::ip::udp::endpoint>       composer_peers_;
+    std::unordered_map<asio::ip::udp::endpoint,
+                       gn_conn_id_t,
+                       EndpointHash>                                composer_endpoint_to_id_;
+    std::unordered_map<gn_conn_id_t, ComposerDataSub>               composer_data_subs_;
+    std::vector<ComposerAcceptSub>                                  composer_accept_subs_;
+    std::atomic<std::uint64_t>                                      next_composer_id_{1};
+    std::atomic<std::uint64_t>                                      next_accept_token_{1};
+    /// True once any `composer_listen` / `composer_connect` opened the
+    /// shared socket. Independent from kernel `listen()` so a pure
+    /// composer-only deployment (no kernel-API call) still works.
+    std::atomic<bool>                                               composer_bound_{false};
 
     std::atomic<std::uint64_t> bytes_in_{0};
     std::atomic<std::uint64_t> bytes_out_{0};

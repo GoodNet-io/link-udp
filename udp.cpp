@@ -345,7 +345,16 @@ gn_result_t UdpLink::send(gn_conn_id_t conn,
     }
 
     asio_ip::udp::endpoint target;
-    {
+    if (conn & kComposerIdBit) {
+        /// Composer-owned conn: lookup in the composer peer map, no
+        /// `last_active` book-keeping (composers run their own
+        /// liveness probes — STUN keepalives for ICE, DTLS-record
+        /// stream framing for the rest).
+        std::lock_guard lk(composer_mu_);
+        auto it = composer_peers_.find(conn);
+        if (it == composer_peers_.end()) return GN_ERR_NOT_FOUND;
+        target = it->second;
+    } else {
         std::lock_guard lk(peers_mu_);
         auto it = peers_.find(conn);
         if (it == peers_.end()) return GN_ERR_NOT_FOUND;
@@ -405,6 +414,19 @@ gn_result_t UdpLink::send_batch(
 }
 
 gn_result_t UdpLink::disconnect(gn_conn_id_t conn) {
+    if (conn & kComposerIdBit) {
+        /// Composer-owned conn: erase from both composer maps. No
+        /// `notify_disconnect` — the kernel never saw this id, only
+        /// the consumer plugin (ICE / DTLS / QUIC) holds it.
+        std::lock_guard lk(composer_mu_);
+        auto it = composer_peers_.find(conn);
+        if (it == composer_peers_.end()) return GN_OK;  /// idempotent
+        composer_endpoint_to_id_.erase(it->second);
+        composer_peers_.erase(it);
+        composer_data_subs_.erase(conn);
+        return GN_OK;
+    }
+
     bool erased = false;
     {
         std::lock_guard lk(peers_mu_);
@@ -429,24 +451,186 @@ gn_result_t UdpLink::disconnect(gn_conn_id_t conn) {
     return GN_OK;
 }
 
-gn_result_t UdpLink::composer_listen(std::string_view /*uri*/) {
-    return GN_ERR_NOT_IMPLEMENTED;
+// ── Composer L2 surface ─────────────────────────────────────────────────
+//
+// Implements `link.en.md` §8 datagram-mode composer contract. UDP has no
+// L4 accept-semantics — composers (ICE) allocate peers explicitly through
+// `composer_connect`. Inbound datagrams from a known composer endpoint
+// dispatch via the per-conn `composer_subscribe_data` callback; unknown
+// endpoints fall through to the kernel `notify_connect` path so the
+// standalone-L1 use case keeps working unchanged. UDP shares one socket
+// between both paths — segregation is by `kComposerIdBit` (bit 63).
+
+gn_result_t UdpLink::composer_listen(std::string_view uri_sv) {
+    if (shutdown_.load(std::memory_order_acquire)) {
+        return GN_ERR_INVALID_STATE;
+    }
+
+    /// One-call scheme-checked parse via the SDK Tier-1 sugar
+    /// `parse_uri_strict` — replaces the prior 3-line
+    /// `parse_uri + is_path_style + scheme!=` pattern.
+    const auto parts = ::gn::parse_uri_strict(uri_sv, "udp");
+    if (!parts || parts->is_path_style()) return GN_ERR_INVALID_ENVELOPE;
+
+    std::error_code ec;
+    const auto addr = asio_ip::make_address(parts->host, ec);
+    if (ec) return GN_ERR_NULL_ARG;
+
+    /// If the kernel-side `listen()` already opened a socket on this
+    /// plugin instance, composer reuses it — UDP has a single FD, and
+    /// rebinding would tear down kernel reception. Capability flag
+    /// `composer_bound_` records that the composer surface has work to
+    /// do on the existing socket; `start_receive()` is already running.
+    if (socket_) {
+        composer_bound_.store(true, std::memory_order_release);
+        return GN_OK;
+    }
+
+    asio_ip::udp::endpoint ep(addr, parts->port);
+    try {
+        asio_ip::udp::socket sock(ioc_);
+        sock.open(ep.protocol());
+        if (addr.is_v6() && addr.is_unspecified()) {
+            std::error_code v6_ec;
+            if (sock.set_option(asio_ip::v6_only(false), v6_ec) &&
+                api_) {
+                gn_log_debug(api_,
+                             "udp: v6_only(false) failed: %s",
+                             v6_ec.message().c_str());
+            }
+        }
+        sock.bind(ep);
+        listen_port_.store(sock.local_endpoint().port(),
+                            std::memory_order_release);
+        socket_.emplace(std::move(sock));
+    } catch (const std::exception&) {
+        return GN_ERR_NULL_ARG;
+    }
+
+    composer_bound_.store(true, std::memory_order_release);
+    start_receive();
+    return GN_OK;
 }
 
-gn_result_t UdpLink::composer_connect(std::string_view /*uri*/,
+gn_result_t UdpLink::composer_connect(std::string_view uri_sv,
                                        gn_conn_id_t* out_conn) {
-    if (out_conn) *out_conn = GN_INVALID_ID;
-    return GN_ERR_NOT_IMPLEMENTED;
+    if (!out_conn) return GN_ERR_NULL_ARG;
+    *out_conn = GN_INVALID_ID;
+    if (shutdown_.load(std::memory_order_acquire)) {
+        return GN_ERR_INVALID_STATE;
+    }
+
+    auto resolved = ::gn::sdk::resolve_uri_host(ioc_, uri_sv);
+    if (!resolved) return GN_ERR_INVALID_ENVELOPE;
+
+    const auto parts = ::gn::parse_uri_strict(*resolved, "udp");
+    if (!parts || parts->is_path_style()) return GN_ERR_INVALID_ENVELOPE;
+    if (parts->port == 0) return GN_ERR_INVALID_ENVELOPE;
+
+    std::error_code ec;
+    const auto addr = asio_ip::make_address(parts->host, ec);
+    if (ec) return GN_ERR_NULL_ARG;
+    asio_ip::udp::endpoint ep(addr, parts->port);
+
+    /// Pure-composer (no kernel listen) needs the outbound socket —
+    /// mirror the kernel `connect()` path. Ephemeral local port on
+    /// the matching protocol family; v6 wildcards disable v6-only so
+    /// v4-mapped sends also work.
+    bool socket_freshly_created = false;
+    if (!socket_) {
+        try {
+            const auto family = addr.is_v6() ? asio_ip::udp::v6()
+                                              : asio_ip::udp::v4();
+            asio_ip::udp::socket sock(
+                ioc_, asio_ip::udp::endpoint(family, 0));
+            if (addr.is_v6()) {
+                std::error_code v6_ec;
+                if (sock.set_option(asio_ip::v6_only(false), v6_ec) &&
+                    api_) {
+                    gn_log_debug(api_,
+                                 "udp: v6_only(false) failed: %s",
+                                 v6_ec.message().c_str());
+                }
+            }
+            listen_port_.store(sock.local_endpoint().port(),
+                                std::memory_order_release);
+            socket_.emplace(std::move(sock));
+            socket_freshly_created = true;
+        } catch (const std::exception&) {
+            return GN_ERR_NULL_ARG;
+        }
+    }
+
+    composer_bound_.store(true, std::memory_order_release);
+
+    const gn_conn_id_t id =
+        next_composer_id_.fetch_add(1, std::memory_order_relaxed) |
+        kComposerIdBit;
+    {
+        std::lock_guard lk(composer_mu_);
+        composer_peers_[id]              = ep;
+        composer_endpoint_to_id_[ep]     = id;
+    }
+
+    if (socket_freshly_created) start_receive();
+
+    *out_conn = id;
+    return GN_OK;
 }
 
-gn_result_t UdpLink::composer_subscribe_data(gn_conn_id_t /*conn*/,
-                                              ::gn_link_data_cb_t /*cb*/,
-                                              void* /*user_data*/) {
-    return GN_ERR_NOT_IMPLEMENTED;
+gn_result_t UdpLink::composer_subscribe_data(gn_conn_id_t conn,
+                                              ::gn_link_data_cb_t cb,
+                                              void* user_data) {
+    if (!cb) return GN_ERR_NULL_ARG;
+    if (!(conn & kComposerIdBit)) return GN_ERR_NOT_FOUND;
+    std::lock_guard lk(composer_mu_);
+    if (composer_peers_.find(conn) == composer_peers_.end()) {
+        return GN_ERR_NOT_FOUND;
+    }
+    composer_data_subs_[conn] = ComposerDataSub{cb, user_data};
+    return GN_OK;
 }
 
-gn_result_t UdpLink::composer_unsubscribe_data(gn_conn_id_t /*conn*/) {
-    return GN_ERR_NOT_IMPLEMENTED;
+gn_result_t UdpLink::composer_unsubscribe_data(gn_conn_id_t conn) {
+    if (!(conn & kComposerIdBit)) return GN_OK;
+    std::lock_guard lk(composer_mu_);
+    composer_data_subs_.erase(conn);
+    return GN_OK;
+}
+
+gn_result_t UdpLink::composer_subscribe_accept(
+    ::gn_link_accept_cb_t cb,
+    void* user_data,
+    gn_subscription_id_t* out_token) {
+    if (!cb || !out_token) return GN_ERR_NULL_ARG;
+    const gn_subscription_id_t token =
+        next_accept_token_.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lk(composer_mu_);
+    composer_accept_subs_.push_back(
+        ComposerAcceptSub{token, cb, user_data});
+    *out_token = token;
+    return GN_OK;
+}
+
+gn_result_t UdpLink::composer_unsubscribe_accept(
+    gn_subscription_id_t token) {
+    std::lock_guard lk(composer_mu_);
+    auto it = std::remove_if(
+        composer_accept_subs_.begin(), composer_accept_subs_.end(),
+        [token](const ComposerAcceptSub& s) { return s.token == token; });
+    composer_accept_subs_.erase(it, composer_accept_subs_.end());
+    return GN_OK;
+}
+
+gn_result_t UdpLink::composer_listen_port(
+    std::uint16_t* out_port) const noexcept {
+    if (!out_port) return GN_ERR_NULL_ARG;
+    *out_port = 0;
+    if (!composer_bound_.load(std::memory_order_acquire)) {
+        return GN_ERR_INVALID_STATE;
+    }
+    *out_port = listen_port_.load(std::memory_order_acquire);
+    return GN_OK;
 }
 
 void UdpLink::start_receive() {
@@ -486,6 +670,84 @@ void UdpLink::start_receive() {
                                     "udp: recv stopped: %s",
                                     ec.message().c_str());
                     }
+                    return;
+                }
+
+                /// Composer-owned endpoints route directly to their
+                /// per-conn subscriber, bypassing the kernel
+                /// `notify_*` machinery. The composer map is checked
+                /// first because composer peers are explicit allocations
+                /// — a kernel-side mapping with the same endpoint would
+                /// be a programming error (composer mode owns the wire).
+                gn_conn_id_t                composer_id = GN_INVALID_ID;
+                ComposerDataSub             composer_sub{};
+                bool                        fresh_composer = false;
+                std::vector<ComposerAcceptSub> accept_snapshot;
+                {
+                    std::lock_guard lk(self->composer_mu_);
+                    if (auto it = self->composer_endpoint_to_id_.find(
+                            self->recv_endpoint_);
+                        it != self->composer_endpoint_to_id_.end()) {
+                        composer_id = it->second;
+                        if (auto sit = self->composer_data_subs_.find(
+                                composer_id);
+                            sit != self->composer_data_subs_.end()) {
+                            composer_sub = sit->second;
+                        }
+                    } else if (!self->composer_accept_subs_.empty()) {
+                        /// New endpoint + active accept-bus: allocate a
+                        /// composer-owned conn id and let subscribers
+                        /// install their per-conn data callback before
+                        /// the triggering datagram is dispatched.
+                        composer_id =
+                            self->next_composer_id_.fetch_add(
+                                1, std::memory_order_relaxed)
+                            | kComposerIdBit;
+                        self->composer_peers_[composer_id] =
+                            self->recv_endpoint_;
+                        self->composer_endpoint_to_id_[
+                            self->recv_endpoint_] = composer_id;
+                        accept_snapshot = self->composer_accept_subs_;
+                        fresh_composer = true;
+                    }
+                }
+                if (fresh_composer) {
+                    /// Fire accept-bus BEFORE delivering the
+                    /// triggering datagram so subscribers get a
+                    /// chance to install their per-conn data
+                    /// callback. Subscribers that omit the
+                    /// installation simply lose the first frame —
+                    /// same semantics as the TCP composer.
+                    const std::string peer_uri =
+                        endpoint_to_uri(self->recv_endpoint_);
+                    for (const auto& s : accept_snapshot) {
+                        if (s.cb) {
+                            s.cb(s.user_data, composer_id,
+                                  peer_uri.c_str());
+                        }
+                    }
+                    /// Re-resolve the data sub — the accept callback
+                    /// may have installed one.
+                    {
+                        std::lock_guard lk(self->composer_mu_);
+                        auto sit = self->composer_data_subs_.find(
+                            composer_id);
+                        if (sit != self->composer_data_subs_.end()) {
+                            composer_sub = sit->second;
+                        }
+                    }
+                }
+                if (composer_id != GN_INVALID_ID) {
+                    self->bytes_in_.fetch_add(bytes,
+                                              std::memory_order_relaxed);
+                    self->frames_in_.fetch_add(1,
+                                              std::memory_order_relaxed);
+                    if (composer_sub.cb && bytes > 0) {
+                        composer_sub.cb(composer_sub.user_data,
+                                        composer_id,
+                                        self->recv_buf_.data(), bytes);
+                    }
+                    self->start_receive();
                     return;
                 }
 
@@ -583,6 +845,18 @@ void UdpLink::shutdown() {
         peers_.clear();
         endpoint_to_id_.clear();
     }
+    /// Composer state has no kernel notify path — the consumer plugin
+    /// (ICE / DTLS / QUIC) owns these ids and observes shutdown through
+    /// its own carrier lifetime (LinkCarrier dtor cleans up). Just
+    /// drop the maps so any in-flight send/disconnect fails cleanly.
+    {
+        std::lock_guard lk(composer_mu_);
+        composer_peers_.clear();
+        composer_endpoint_to_id_.clear();
+        composer_data_subs_.clear();
+        composer_accept_subs_.clear();
+    }
+    composer_bound_.store(false, std::memory_order_release);
     if (api_ && api_->notify_disconnect) {
         for (const auto conn : closing) {
             if (const auto rc = api_->notify_disconnect(

@@ -16,3 +16,19 @@ endif()
 gtest_discover_tests(test_udp
     DISCOVERY_TIMEOUT 30
     PROPERTIES TIMEOUT 60)
+
+add_executable(test_udp_composer test_composer.cpp)
+target_link_libraries(test_udp_composer PRIVATE
+    GoodNet::sdk
+    goodnet_udp_objects
+    asio::asio
+    Threads::Threads
+    GTest::gtest
+    GTest::gtest_main)
+target_compile_features(test_udp_composer PRIVATE cxx_std_23)
+if(COMMAND goodnet_apply_pch)
+    goodnet_apply_pch(test_udp_composer)
+endif()
+gtest_discover_tests(test_udp_composer
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES TIMEOUT 60)
