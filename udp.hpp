@@ -37,7 +37,7 @@
 #include <asio/ip/udp.hpp>
 #include <asio/strand.hpp>
 
-#include <core/util/token_bucket.hpp>
+#include <sdk/cpp/token_bucket.hpp>
 
 #include <sdk/extensions/link.h>
 #include <sdk/host_api.h>
@@ -237,7 +237,7 @@ private:
                        EndpointHash>                                endpoint_to_id_;
 
     std::atomic<std::uint32_t>                                      mtu_{kDefaultMtu};
-    ::gn::util::RateLimiterMap<>                                    new_conn_limiter_{
+    ::gn::ratelimit::RateLimiterMap<>                                    new_conn_limiter_{
         kNewConnRate, kNewConnBurst};
     /// Token issued by `subscribe(GN_SUBSCRIBE_CONFIG_RELOAD)`; reset on
     /// `set_host_api(nullptr)` and on dtor so the kernel's
