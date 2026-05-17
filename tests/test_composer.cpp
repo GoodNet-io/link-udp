@@ -35,9 +35,9 @@ using gn::link::udp::UdpLink;
 /// stub host API is still attached so any reload-subscription side-
 /// effects in `set_host_api` have something to bind to.
 ///
-/// Migrated 2026-05-12 to the shared `gn::sdk::test::LinkStub` —
-/// the local 40-LOC stub used to track only 3 counters; the SDK
-/// helper adds `conns / roles / trusts` tracking at near-zero cost.
+/// Uses the shared `gn::sdk::test::LinkStub` which tracks
+/// `conns / roles / trusts` per call alongside the captured
+/// payloads.
 using StubHost = ::gn::sdk::test::LinkStub;
 inline host_api_t make_stub_api(StubHost& h) noexcept {
     return ::gn::sdk::test::make_link_host_api(h);
