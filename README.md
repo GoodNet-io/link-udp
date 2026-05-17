@@ -35,4 +35,5 @@ the `udp` scheme. See `docs/install.en.md` and
 ## Contract
 
 - Kernel-side link contract: `docs/contracts/link.en.md`
-- Datagram-class invariants: `docs/contracts/link.en.md` §reliability
+- Datagram-class invariants: `docs/contracts/link.en.md` §8
+  (capability bits, including `GN_LINK_CAP_RELIABLE`)
