@@ -219,7 +219,7 @@ gn_result_t UdpLink::listen(std::string_view uri_sv) {
 gn_result_t UdpLink::connect(std::string_view uri_sv) {
     if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
 
-    /// Hostname → IP literal up-front per `dns.md` §1; IP-literal
+    /// Hostname → IP literal up-front per `dns.en.md` §1; IP-literal
     /// hosts short-circuit through the helper without a lookup.
     auto resolved = ::gn::sdk::resolve_uri_host(ioc_, uri_sv);
     if (!resolved) return GN_ERR_INVALID_ENVELOPE;
