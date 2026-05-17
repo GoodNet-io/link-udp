@@ -33,9 +33,8 @@ namespace {
 using namespace std::chrono_literals;
 using gn::link::udp::UdpLink;
 
-/// Migrated 2026-05-12 from the local 70-LOC StubHost copy to the
-/// shared `gn::sdk::test::LinkStub`. `trusts` tracking lives in the
-/// SDK helper now — see `sdk/cpp/test/stub_host.hpp`.
+/// Alias to the shared `gn::sdk::test::LinkStub`. `trusts` tracking
+/// lives in the SDK helper — see `sdk/cpp/test/stub_host.hpp`.
 using StubHost = ::gn::sdk::test::LinkStub;
 
 inline host_api_t make_stub_api(StubHost& h) noexcept {
