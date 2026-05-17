@@ -12,9 +12,8 @@
 /// `notify_inbound_bytes` per `recvfrom` and rejects any send larger
 /// than the configured MTU. Per-source rate limiting on
 /// new-connection allocation closes the spoofed-source amplification
-/// path the audit class TR-S7 describes — without it an attacker
-/// can mint connection records faster than the kernel reaps idle
-/// ones.
+/// path — without it an attacker can mint connection records faster
+/// than the kernel reaps idle ones.
 
 #pragma once
 
