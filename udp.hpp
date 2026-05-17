@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 /// @file   plugins/links/udp/udp.hpp
-/// @brief  Asio UDP datagram transport per `link.md` §3
+/// @brief  Asio UDP datagram transport per `link.en.md` §3
 ///         (datagram-mode, single-socket, per-peer synthetic conn_id).
 ///
 /// UDP is the first datagram transport in the tree, so the shape is
@@ -69,7 +69,7 @@ public:
     UdpLink& operator=(const UdpLink&) = delete;
 
     /// Bind the URI and start receiving. URI form
-    /// `udp://host:port` per `uri.md`. Port 0 lets the OS pick;
+    /// `udp://host:port` per `uri.en.md`. Port 0 lets the OS pick;
     /// the actual bound port is available through `listen_port()`.
     [[nodiscard]] gn_result_t listen(std::string_view uri);
 

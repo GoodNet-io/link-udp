@@ -250,7 +250,7 @@ TEST(UdpLink, ConnectRejectsZeroPort) {
     t->set_host_api(&api);
 
     /// Listen accepts port 0 (ephemeral allocation); connect rejects
-    /// it at the application layer per `uri.md` §5.
+    /// it at the application layer per `uri.en.md` §5.
     EXPECT_NE(t->connect("udp://127.0.0.1:0"), GN_OK);
     t->shutdown();
 }

@@ -226,7 +226,7 @@ gn_result_t UdpLink::connect(std::string_view uri_sv) {
 
     const auto parts = ::gn::parse_uri(*resolved);
     if (!parts || parts->is_path_style()) return GN_ERR_INVALID_ENVELOPE;
-    /// `connect`-side rejects port 0 per `uri.md` §5 — listen accepts
+    /// `connect`-side rejects port 0 per `uri.en.md` §5 — listen accepts
     /// it for ephemeral allocation, but a zero target port is never a
     /// real peer.
     if (parts->port == 0) return GN_ERR_INVALID_ENVELOPE;
@@ -638,7 +638,7 @@ void UdpLink::start_receive() {
 
     /// Capture a weak observer, not a strong reference. A strong
     /// capture would close a cycle through `ioc_` (which owns the
-    /// pending op) and leak the transport — `plugin-lifetime.md` §4.
+    /// pending op) and leak the transport — `plugin-lifetime.en.md` §4.
     socket_->async_receive_from(
         asio::buffer(recv_buf_), recv_endpoint_,
         asio::bind_executor(strand_,
