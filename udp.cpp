@@ -13,6 +13,8 @@
 #include <asio/dispatch.hpp>
 #include <asio/ip/v6_only.hpp>
 #include <system_error>
+#include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <cstring>
@@ -673,6 +675,21 @@ void UdpLink::start_receive() {
                     return;
                 }
 
+                {
+                    static const bool dbg = []{
+                        const char* s = std::getenv("ICE_DEBUG");
+                        return s && s[0] == '1';
+                    }();
+                    if (dbg) {
+                        std::fprintf(stderr,
+                            "[udp-dbg] recv from %s:%u len=%zu\n",
+                            self->recv_endpoint_.address().to_string().c_str(),
+                            self->recv_endpoint_.port(),
+                            bytes);
+                        std::fflush(stderr);
+                    }
+                }
+
                 /// Composer-owned endpoints route directly to their
                 /// per-conn subscriber, bypassing the kernel
                 /// `notify_*` machinery. The composer map is checked
@@ -742,6 +759,19 @@ void UdpLink::start_receive() {
                                               std::memory_order_relaxed);
                     self->frames_in_.fetch_add(1,
                                               std::memory_order_relaxed);
+                    {
+                        static const bool dbg = []{
+                            const char* s = std::getenv("ICE_DEBUG");
+                            return s && s[0] == '1';
+                        }();
+                        if (dbg) {
+                            std::fprintf(stderr,
+                                "[udp-dbg] composer-dispatch cid=%llu has_cb=%d bytes=%zu\n",
+                                static_cast<unsigned long long>(composer_id),
+                                composer_sub.cb ? 1 : 0, bytes);
+                            std::fflush(stderr);
+                        }
+                    }
                     if (composer_sub.cb && bytes > 0) {
                         composer_sub.cb(composer_sub.user_data,
                                         composer_id,
@@ -749,6 +779,21 @@ void UdpLink::start_receive() {
                     }
                     self->start_receive();
                     return;
+                }
+
+                {
+                    static const bool dbg = []{
+                        const char* s = std::getenv("ICE_DEBUG");
+                        return s && s[0] == '1';
+                    }();
+                    if (dbg) {
+                        std::fprintf(stderr,
+                            "[udp-dbg] composer-miss endpoint=%s:%u accept_subs=%zu\n",
+                            self->recv_endpoint_.address().to_string().c_str(),
+                            self->recv_endpoint_.port(),
+                            self->composer_accept_subs_.size());
+                        std::fflush(stderr);
+                    }
                 }
 
                 /// Both the existing-conn lookup and the new-conn
