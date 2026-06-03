@@ -31,6 +31,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <sys/socket.h>
+
 #include <asio/executor_work_guard.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/udp.hpp>
@@ -40,8 +42,14 @@
 
 #include <sdk/extensions/link.h>
 #include <sdk/host_api.h>
+#include <sdk/security.h>
+#include <sdk/topology.h>
 #include <sdk/trust.h>
 #include <sdk/types.h>
+
+#if __GNUC__ >= 16 && __cplusplus >= 202600L
+#  define GN_UDP_CXX26_SEND 1
+#endif
 
 namespace gn::link::udp {
 
@@ -51,6 +59,12 @@ namespace gn::link::udp {
 /// `set_mtu` once the v1 extension surface lands.
 inline constexpr std::uint32_t kDefaultMtu = 1200;
 
+/// ChaCha20-Poly1305 AEAD tag size. Subtracted from the advertised
+/// MTU when the topology confirms an E2E-capable security provider
+/// (e.g. Noise) is active, so upper layers never produce frames that
+/// overflow the path after encryption.
+inline constexpr std::uint32_t kNoiseOverhead = 16;
+
 /// Per-source-IP rate limiter on new-connection allocations. An
 /// attacker spraying spoofed source addresses at the listening port
 /// would otherwise allocate one ConnectionRecord per packet and
@@ -58,6 +72,11 @@ inline constexpr std::uint32_t kDefaultMtu = 1200;
 /// burst 50 is comfortably above any legitimate client churn.
 inline constexpr double kNewConnRate  = 10.0;
 inline constexpr double kNewConnBurst = 50.0;
+
+/// Maximum frames in one sendmmsg / recvmmsg batch.
+/// Sized to avoid overflowing the strand's internal handler buffer in
+/// a burst; 64 × max-MTU (1500) = 96 KiB per batch direction.
+inline constexpr int kUdpBatchCap = 64;
 
 class UdpLink : public std::enable_shared_from_this<UdpLink> {
 public:
@@ -136,6 +155,13 @@ public:
 
     void set_host_api(const host_api_t* api) noexcept;
 
+    /// Called by the kernel once all plugins have registered.
+    /// Inspects the security table: if any provider carries
+    /// GN_SEC_PROVIDES_E2E_ENCRYPTION, reduces the advertised MTU by
+    /// kNoiseOverhead so callers never emit frames that overflow the
+    /// path after AEAD encryption.
+    void on_topology_sealed(const gn_topology_t* topo) noexcept;
+
     /// Reconfigure the per-source-IP new-connection limiter live.
     /// Public so the config-reload callback in the .cpp can call
     /// it from a free function without going through internals.
@@ -199,6 +225,9 @@ private:
     };
 
     void start_receive();
+    /// Drain the socket's kernel recv queue with one `recvmmsg(MSG_DONTWAIT)`
+    /// burst after each `async_receive_from` wake-up.  Strand-only.
+    void drain_recv_batch();
     [[nodiscard]] gn_trust_class_t resolve_trust(
         const asio::ip::udp::endpoint& peer) const noexcept;
     [[nodiscard]] static std::string endpoint_to_uri(
@@ -224,10 +253,32 @@ private:
     std::atomic<std::uint16_t>                                   listen_port_{0};
     std::atomic<bool>                                            shutdown_{false};
 
-    /// Receive scratch buffer. 64 KiB matches the IPv4/v6 datagram
-    /// theoretical max so any legitimately-accepted payload fits.
+    /// Receive scratch buffer for the single-datagram asio path.
+    /// 64 KiB covers any legitimate UDP payload.
     std::array<std::uint8_t, 65536>                              recv_buf_{};
     asio::ip::udp::endpoint                               recv_endpoint_;
+
+    /// Strand-exclusive batch receive scratch.  Filled by `drain_recv_batch`
+    /// (called on the strand after every `async_receive_from` wake-up) to
+    /// drain the socket queue in one `recvmmsg(MSG_DONTWAIT)` burst.
+    /// None of these are accessed outside the strand.
+    std::array<std::array<std::uint8_t, 65536>, kUdpBatchCap> recv_pool_{};
+    std::array<iovec,        kUdpBatchCap>                     recv_iovs_{};
+    std::array<mmsghdr,      kUdpBatchCap>                     recv_msgs_{};
+    std::array<sockaddr_storage, kUdpBatchCap>                 recv_addrs_{};
+
+#ifdef GN_UDP_CXX26_SEND
+    /// Per-slot pre-allocated send buffers (GCC16/C++26 ring path).
+    /// Slot size matches the default MTU so the ring (~75 KiB) stays
+    /// in L2 cache.  Frames larger than kSendSlotSize fall through to
+    /// the heap path (only possible when set_mtu() raises the MTU).
+    static constexpr int         kSendRingCap  = 64;
+    static constexpr std::size_t kSendSlotSize = kDefaultMtu;  // 1200
+    std::array<std::array<std::uint8_t, kSendSlotSize>, kSendRingCap> send_ring_bufs_{};
+    std::array<std::size_t,       kSendRingCap>                       send_ring_lens_{};
+    std::array<std::atomic<bool>, kSendRingCap>                       send_ring_slots_{};
+    std::atomic<int>                                                   send_ring_head_{0};
+#endif
 
     mutable std::mutex                                              peers_mu_;
     std::unordered_map<gn_conn_id_t, PeerEntry>                     peers_;
@@ -282,6 +333,7 @@ private:
     std::atomic<std::uint64_t> frames_out_{0};
 
     const host_api_t* api_ = nullptr;
+
 };
 
 }  // namespace gn::link::udp

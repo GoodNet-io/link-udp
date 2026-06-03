@@ -6,6 +6,7 @@
 
 #include <sdk/convenience.h>
 #include <sdk/cpp/dns.hpp>
+#include <sdk/cpp/log.hpp>
 #include <sdk/cpp/uri.hpp>
 
 #include <asio/bind_executor.hpp>
@@ -21,6 +22,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 namespace gn::link::udp {
 
@@ -154,6 +159,25 @@ void UdpLink::set_mtu(std::uint32_t bytes) noexcept {
     mtu_.store(bytes, std::memory_order_relaxed);
 }
 
+void UdpLink::on_topology_sealed(const gn_topology_t* topo) noexcept {
+    if (!topo) return;
+    bool e2e = false;
+    for (std::uint32_t i = 0; i < topo->security_count; ++i) {
+        if (topo->security[i].provides_flags & GN_SEC_PROVIDES_E2E_ENCRYPTION) {
+            e2e = true;
+            break;
+        }
+    }
+    const std::uint32_t base = mtu_.load(std::memory_order_relaxed);
+    const std::uint32_t adjusted = e2e ? (base > kNoiseOverhead ? base - kNoiseOverhead : base)
+                                       : base;
+    if (adjusted != base)
+        mtu_.store(adjusted, std::memory_order_relaxed);
+    if (api_)
+        gn::log::info(api_, "udp: topology sealed e2e={} mtu={}",
+                      e2e ? 1 : 0, adjusted);
+}
+
 gn_trust_class_t UdpLink::resolve_trust(
     const asio_ip::udp::endpoint& peer) const noexcept
 {
@@ -201,9 +225,9 @@ gn_result_t UdpLink::listen(std::string_view uri_sv) {
             std::error_code v6_ec;
             if (sock.set_option(asio_ip::v6_only(false), v6_ec) &&
                 api_) {
-                gn_log_debug(api_,
-                             "udp: v6_only(false) failed: %s",
-                             v6_ec.message().c_str());
+                gn::log::debug(api_,
+                               "udp: v6_only(false) failed: {}",
+                               std::string_view{v6_ec.message()});
             }
         }
         sock.bind(ep);
@@ -253,9 +277,9 @@ gn_result_t UdpLink::connect(std::string_view uri_sv) {
                 std::error_code v6_ec;
                 if (sock.set_option(asio_ip::v6_only(false), v6_ec) &&
                     api_) {
-                    gn_log_debug(api_,
-                                 "udp: v6_only(false) failed: %s",
-                                 v6_ec.message().c_str());
+                    gn::log::debug(api_,
+                                   "udp: v6_only(false) failed: {}",
+                                   std::string_view{v6_ec.message()});
                 }
             }
             socket_.emplace(std::move(sock));
@@ -271,9 +295,9 @@ gn_result_t UdpLink::connect(std::string_view uri_sv) {
             /// API there is nowhere for received bytes to flow.
             std::error_code close_ec;
             if (socket_->close(close_ec) && api_) {
-                gn_log_debug(api_,
-                             "udp: rollback close: %s",
-                             close_ec.message().c_str());
+                gn::log::debug(api_,
+                               "udp: rollback close: {}",
+                               std::string_view{close_ec.message()});
             }
             socket_.reset();
         }
@@ -310,9 +334,9 @@ gn_result_t UdpLink::connect(std::string_view uri_sv) {
             if (socket_freshly_created) {
                 std::error_code close_ec;
                 if (socket_->close(close_ec) && api_) {
-                    gn_log_debug(api_,
-                                 "udp: rollback close: %s",
-                                 close_ec.message().c_str());
+                    gn::log::debug(api_,
+                                   "udp: rollback close: {}",
+                                   std::string_view{close_ec.message()});
                 }
                 socket_.reset();
             }
@@ -327,9 +351,9 @@ gn_result_t UdpLink::connect(std::string_view uri_sv) {
     if (api_->kick_handshake) {
         if (const auto rc = api_->kick_handshake(api_->host_ctx, conn);
             rc != GN_OK && api_) {
-            gn_log_debug(api_,
-                         "udp: kick_handshake rc=%d for conn=%llu",
-                         rc, static_cast<unsigned long long>(conn));
+            gn::log::debug(api_,
+                           "udp: kick_handshake rc={} for conn={}",
+                           static_cast<int>(rc), static_cast<unsigned long long>(conn));
         }
     }
     return GN_OK;
@@ -365,9 +389,50 @@ gn_result_t UdpLink::send(gn_conn_id_t conn,
     }
 
     /// Asio forbids overlapping ops on one socket; the strand is the
-    /// only writer just like it is the only reader. The payload
-    /// rides in `buf` so the caller's span can vanish before the
-    /// syscall completes.
+    /// only writer just like it is the only reader. The payload is
+    /// copied before the syscall so the caller's span can vanish.
+#ifdef GN_UDP_CXX26_SEND
+    if (bytes.size() <= kSendSlotSize) {
+        int idx = send_ring_head_.fetch_add(1, std::memory_order_relaxed)
+                  & (kSendRingCap - 1);
+        bool expected = false;
+        if (send_ring_slots_[idx].compare_exchange_strong(
+                expected, true,
+                std::memory_order_acquire, std::memory_order_relaxed)) {
+            std::memcpy(send_ring_bufs_[idx].data(), bytes.data(), bytes.size());
+            send_ring_lens_[idx] = bytes.size();
+            auto self = shared_from_this();
+            asio::dispatch(strand_,
+                [weak = std::weak_ptr<UdpLink>(self), idx, target] {
+                    auto t = weak.lock();
+                    if (!t || t->shutdown_.load(std::memory_order_acquire)) {
+                        if (t) t->send_ring_slots_[idx].store(
+                                   false, std::memory_order_release);
+                        return;
+                    }
+                    t->socket_->async_send_to(
+                        asio::buffer(t->send_ring_bufs_[idx].data(),
+                                     t->send_ring_lens_[idx]),
+                        target,
+                        asio::bind_executor(t->strand_,
+                            [weak, idx](const std::error_code& ec,
+                                        std::size_t n) {
+                                auto t2 = weak.lock();
+                                if (!t2) return;
+                                t2->send_ring_slots_[idx].store(
+                                    false, std::memory_order_release);
+                                if (ec) return;
+                                t2->bytes_out_.fetch_add(
+                                    n, std::memory_order_relaxed);
+                                t2->frames_out_.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }));
+                });
+            return GN_OK;
+        }
+        // Slot already in use (ring saturated) — fall through to heap path.
+    }
+#endif
     auto buf = std::make_shared<std::vector<std::uint8_t>>(
         bytes.begin(), bytes.end());
     auto self = shared_from_this();
@@ -384,9 +449,9 @@ gn_result_t UdpLink::send(gn_conn_id_t conn,
                         if (!t2) return;
                         if (send_ec) {
                             if (t2->api_) {
-                                gn_log_debug(t2->api_,
-                                             "udp: send_to failed: %s",
-                                             send_ec.message().c_str());
+                                gn::log::debug(t2->api_,
+                                               "udp: send_to failed: {}",
+                                               std::string_view{send_ec.message()});
                             }
                             return;
                         }
@@ -405,13 +470,97 @@ gn_result_t UdpLink::send_batch(
     /// boundary on the wire. Pre-validate every frame against MTU
     /// up front so a partial batch never lands on the wire when one
     /// frame is malformed; either every frame goes out or nothing.
+    if (shutdown_.load(std::memory_order_acquire)) return GN_ERR_NULL_ARG;
+    if (!socket_) return GN_ERR_NULL_ARG;
+    if (frames.empty()) return GN_OK;
+
     const auto cap = mtu_.load(std::memory_order_relaxed);
     for (const auto& f : frames) {
         if (f.size() > cap) return GN_ERR_PAYLOAD_TOO_LARGE;
     }
-    for (const auto& f : frames) {
-        if (const auto rc = send(conn, f); rc != GN_OK) return rc;
+
+    /// Fast path for batches that exceed kUdpBatchCap: fall back to
+    /// individual send() so the hot path below never needs a dynamic
+    /// allocation for the per-frame metadata.
+    if (frames.size() > static_cast<std::size_t>(kUdpBatchCap)) {
+        for (const auto& f : frames) {
+            if (const auto rc = send(conn, f); rc != GN_OK) return rc;
+        }
+        return GN_OK;
     }
+
+    /// Resolve the target endpoint once for the whole batch.
+    asio_ip::udp::endpoint target;
+    if (conn & kComposerIdBit) {
+        std::lock_guard lk(composer_mu_);
+        auto it = composer_peers_.find(conn);
+        if (it == composer_peers_.end()) return GN_ERR_NOT_FOUND;
+        target = it->second;
+    } else {
+        std::lock_guard lk(peers_mu_);
+        auto it = peers_.find(conn);
+        if (it == peers_.end()) return GN_ERR_NOT_FOUND;
+        target = it->second.endpoint;
+        it->second.last_active = std::chrono::steady_clock::now();
+    }
+
+    /// Copy all frame data into one flat buffer (one allocation).
+    /// The caller's spans die after this function returns; the dispatch
+    /// lambda must own the data.
+    std::size_t total = 0;
+    for (const auto& f : frames) total += f.size();
+    auto buf = std::make_shared<std::vector<std::uint8_t>>(total);
+    std::size_t off = 0;
+    const int n = static_cast<int>(frames.size());
+
+    struct FrameMeta { std::uint32_t off; std::uint32_t len; };
+    std::array<FrameMeta, kUdpBatchCap> meta{};
+    for (int i = 0; i < n; ++i) {
+        meta[i] = {static_cast<std::uint32_t>(off),
+                   static_cast<std::uint32_t>(frames[i].size())};
+        std::copy(frames[i].begin(), frames[i].end(), buf->data() + off);
+        off += frames[i].size();
+    }
+
+    /// Dispatch to strand: build mmsghdr/iovec on the strand's stack
+    /// (sendmmsg is synchronous — arrays alive for its duration) and
+    /// fire one syscall for the whole batch.
+    auto self = shared_from_this();
+    asio::dispatch(strand_,
+        [weak = std::weak_ptr<UdpLink>(self), buf, target, n, meta]() mutable {
+            auto t = weak.lock();
+            if (!t || t->shutdown_.load(std::memory_order_acquire)) return;
+
+            mmsghdr  msgs[kUdpBatchCap]{};
+            iovec    iovs[kUdpBatchCap]{};
+
+            for (int i = 0; i < n; ++i) {
+                iovs[i].iov_base = buf->data() + meta[i].off;
+                iovs[i].iov_len  = meta[i].len;
+                msgs[i].msg_hdr.msg_iov     = &iovs[i];
+                msgs[i].msg_hdr.msg_iovlen  = 1;
+                msgs[i].msg_hdr.msg_name    =
+                    const_cast<void*>(
+                        static_cast<const void*>(target.data()));
+                msgs[i].msg_hdr.msg_namelen =
+                    static_cast<socklen_t>(target.size());
+            }
+
+            const int sent = ::sendmmsg(
+                t->socket_->native_handle(),
+                msgs, static_cast<unsigned>(n), 0);
+            if (sent > 0) {
+                std::size_t bytes = 0;
+                for (int i = 0; i < sent; ++i) bytes += msgs[i].msg_len;
+                t->bytes_out_.fetch_add(bytes, std::memory_order_relaxed);
+                t->frames_out_.fetch_add(
+                    static_cast<std::uint64_t>(sent),
+                    std::memory_order_relaxed);
+            } else if (sent < 0 && t->api_) {
+                gn::log::debug(t->api_, "udp: sendmmsg failed: {}",
+                               static_cast<const char*>(std::strerror(errno)));
+            }
+        });
     return GN_OK;
 }
 
@@ -445,9 +594,9 @@ gn_result_t UdpLink::disconnect(gn_conn_id_t conn) {
         if (const auto rc = api_->notify_disconnect(
                 api_->host_ctx, conn, GN_OK);
             rc != GN_OK && api_) {
-            gn_log_debug(api_,
-                         "udp: notify_disconnect rc=%d for conn=%llu",
-                         rc, static_cast<unsigned long long>(conn));
+            gn::log::debug(api_,
+                           "udp: notify_disconnect rc={} for conn={}",
+                           static_cast<int>(rc), static_cast<unsigned long long>(conn));
         }
     }
     return GN_OK;
@@ -496,9 +645,9 @@ gn_result_t UdpLink::composer_listen(std::string_view uri_sv) {
             std::error_code v6_ec;
             if (sock.set_option(asio_ip::v6_only(false), v6_ec) &&
                 api_) {
-                gn_log_debug(api_,
-                             "udp: v6_only(false) failed: %s",
-                             v6_ec.message().c_str());
+                gn::log::debug(api_,
+                               "udp: v6_only(false) failed: {}",
+                               std::string_view{v6_ec.message()});
             }
         }
         sock.bind(ep);
@@ -549,9 +698,9 @@ gn_result_t UdpLink::composer_connect(std::string_view uri_sv,
                 std::error_code v6_ec;
                 if (sock.set_option(asio_ip::v6_only(false), v6_ec) &&
                     api_) {
-                    gn_log_debug(api_,
-                                 "udp: v6_only(false) failed: %s",
-                                 v6_ec.message().c_str());
+                    gn::log::debug(api_,
+                                   "udp: v6_only(false) failed: {}",
+                                   std::string_view{v6_ec.message()});
                 }
             }
             listen_port_.store(sock.local_endpoint().port(),
@@ -617,10 +766,8 @@ gn_result_t UdpLink::composer_subscribe_accept(
 gn_result_t UdpLink::composer_unsubscribe_accept(
     gn_subscription_id_t token) {
     std::lock_guard lk(composer_mu_);
-    auto it = std::remove_if(
-        composer_accept_subs_.begin(), composer_accept_subs_.end(),
-        [token](const ComposerAcceptSub& s) { return s.token == token; });
-    composer_accept_subs_.erase(it, composer_accept_subs_.end());
+    std::erase_if(composer_accept_subs_,
+                  [token](const ComposerAcceptSub& s) { return s.token == token; });
     return GN_OK;
 }
 
@@ -668,9 +815,9 @@ void UdpLink::start_receive() {
                         return;
                     }
                     if (self->api_) {
-                        gn_log_warn(self->api_,
-                                    "udp: recv stopped: %s",
-                                    ec.message().c_str());
+                        gn::log::warn(self->api_,
+                                      "udp: recv stopped: {}",
+                                      std::string_view{ec.message()});
                     }
                     return;
                 }
@@ -856,8 +1003,8 @@ void UdpLink::start_receive() {
                     if (const auto rc = self->api_->kick_handshake(
                             self->api_->host_ctx, id);
                         rc != GN_OK && self->api_) {
-                        gn_log_debug(self->api_,
-                                     "udp: kick_handshake rc=%d", rc);
+                        gn::log::debug(self->api_,
+                                       "udp: kick_handshake rc={}", static_cast<int>(rc));
                     }
                 }
 
@@ -872,8 +1019,105 @@ void UdpLink::start_receive() {
                     }
                 }
 
+                /// Drain any additional datagrams that arrived while
+                /// the callback was running — one syscall per burst
+                /// instead of one epoll_wait per packet.
+                self->drain_recv_batch();
                 self->start_receive();
             }));
+}
+
+void UdpLink::drain_recv_batch() {
+    if (!socket_ || shutdown_.load(std::memory_order_acquire)) return;
+
+    /// Initialise iovec + per-message sockaddr once (idempotent after
+    /// first call; the arrays are members so they survive across calls).
+    for (int i = 0; i < kUdpBatchCap; ++i) {
+        recv_iovs_[i].iov_base = recv_pool_[i].data();
+        recv_iovs_[i].iov_len  = recv_pool_[i].size();
+        recv_msgs_[i].msg_hdr  = {};
+        recv_msgs_[i].msg_hdr.msg_iov     = &recv_iovs_[i];
+        recv_msgs_[i].msg_hdr.msg_iovlen  = 1;
+        recv_msgs_[i].msg_hdr.msg_name    = &recv_addrs_[i];
+        recv_msgs_[i].msg_hdr.msg_namelen = sizeof(recv_addrs_[i]);
+    }
+
+    const int n = ::recvmmsg(socket_->native_handle(),
+                             recv_msgs_.data(), kUdpBatchCap,
+                             MSG_DONTWAIT, nullptr);
+    if (n <= 0) return;
+
+    for (int i = 0; i < n; ++i) {
+        const std::size_t bytes = recv_msgs_[i].msg_len;
+        if (bytes == 0) continue;
+
+        /// Reconstruct the asio endpoint from the per-message sockaddr so
+        /// the existing routing logic (composer map, kernel notify_connect)
+        /// works unchanged.
+        asio_ip::udp::endpoint ep;
+        const auto* sa = reinterpret_cast<const sockaddr*>(&recv_addrs_[i]);
+        if (sa->sa_family == AF_INET6) {
+            asio_ip::address_v6::bytes_type b{};
+            const auto* sin6 =
+                reinterpret_cast<const sockaddr_in6*>(sa);
+            std::copy(std::begin(sin6->sin6_addr.s6_addr),
+                      std::end(sin6->sin6_addr.s6_addr), b.begin());
+            ep = asio_ip::udp::endpoint(
+                asio_ip::address_v6(b, sin6->sin6_scope_id),
+                ntohs(sin6->sin6_port));
+        } else {
+            const auto* sin =
+                reinterpret_cast<const sockaddr_in*>(sa);
+            ep = asio_ip::udp::endpoint(
+                asio_ip::address_v4(ntohl(sin->sin_addr.s_addr)),
+                ntohs(sin->sin_port));
+        }
+
+        /// Route through the same composer / kernel dispatch logic used
+        /// by the main `async_receive_from` callback.  Temporarily
+        /// override `recv_endpoint_` and `recv_buf_` so shared helpers
+        /// in the callback path continue to work — this function runs
+        /// on the strand so no data race exists.
+        recv_endpoint_ = ep;
+        std::copy(recv_pool_[i].data(), recv_pool_[i].data() + bytes,
+                  recv_buf_.data());
+
+        bytes_in_.fetch_add(bytes, std::memory_order_relaxed);
+        frames_in_.fetch_add(1,     std::memory_order_relaxed);
+
+        gn_conn_id_t                composer_id = GN_INVALID_ID;
+        ComposerDataSub             composer_sub{};
+        {
+            std::lock_guard lk(composer_mu_);
+            if (auto it = composer_endpoint_to_id_.find(ep);
+                it != composer_endpoint_to_id_.end()) {
+                composer_id = it->second;
+                if (auto sit = composer_data_subs_.find(composer_id);
+                    sit != composer_data_subs_.end()) {
+                    composer_sub = sit->second;
+                }
+            }
+        }
+        if (composer_id != GN_INVALID_ID && composer_sub.cb) {
+            composer_sub.cb(composer_sub.user_data, composer_id,
+                            recv_buf_.data(), bytes);
+            continue;
+        }
+
+        if (!api_ || !api_->notify_inbound_bytes) continue;
+        gn_conn_id_t id = GN_INVALID_ID;
+        {
+            std::lock_guard lk(peers_mu_);
+            if (auto it = endpoint_to_id_.find(ep);
+                it != endpoint_to_id_.end()) {
+                id = it->second;
+                peers_[id].last_active = std::chrono::steady_clock::now();
+            }
+        }
+        if (id == GN_INVALID_ID) continue;
+        api_->notify_inbound_bytes(api_->host_ctx, id,
+                                   recv_buf_.data(), bytes);
+    }
 }
 
 void UdpLink::shutdown() {
@@ -907,9 +1151,9 @@ void UdpLink::shutdown() {
             if (const auto rc = api_->notify_disconnect(
                     api_->host_ctx, conn, GN_OK);
                 rc != GN_OK && api_) {
-                gn_log_debug(api_,
-                             "udp: notify_disconnect rc=%d for conn=%llu",
-                             rc, static_cast<unsigned long long>(conn));
+                gn::log::debug(api_,
+                               "udp: notify_disconnect rc={} for conn={}",
+                               static_cast<int>(rc), static_cast<unsigned long long>(conn));
             }
         }
     }
@@ -917,8 +1161,8 @@ void UdpLink::shutdown() {
     if (socket_) {
         std::error_code ec;
         if (socket_->close(ec) && api_) {
-            gn_log_debug(api_,
-                         "udp: close failed: %s", ec.message().c_str());
+            gn::log::debug(api_,
+                           "udp: close failed: {}", std::string_view{ec.message()});
         }
         socket_.reset();
     }
